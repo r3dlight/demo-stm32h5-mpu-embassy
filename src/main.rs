@@ -235,7 +235,7 @@ async fn main(spawner: Spawner) {
 #[embassy_executor::task(pool_size = 1)]
 async fn blink(led: AnyPin) {
     // As a user task can access peripherials, we can set the current task as unprivileged
-    set_unoriviliged();
+    set_unpriviliged();
     let mut led = Output::new(led, Level::High, Speed::Low);
     let delay = Duration::from_millis(100 as u64);
 
@@ -262,7 +262,7 @@ async fn blink(led: AnyPin) {
 #[embassy_executor::task(pool_size = 2)]
 async fn button_pressed(pc13: AnyPin, exti13: AnyChannel) {
     // As a user task can access peripherials, we can also set the current task as unprivileged
-    set_unoriviliged();
+    set_unpriviliged();
     let mut button = ExtiInput::new(pc13, exti13, Pull::Down);
 
     loop {
@@ -277,7 +277,7 @@ async fn button_pressed(pc13: AnyPin, exti13: AnyChannel) {
 #[embassy_executor::task]
 async fn user_task() {
     // Set the current task as unprivileged
-    set_unoriviliged();
+    set_unpriviliged();
     unsafe {
         // Write some data to the shared buffer
         let data = b"Hello USER !";
@@ -290,7 +290,7 @@ async fn user_task() {
 
 // Blocking & unsafe function, not a task
 // Set the current task as unprivileged
-fn set_unoriviliged() {
+fn set_unpriviliged() {
     unsafe {
         // Unsafe code to modify the CONTROL register
         // Read the current value of the CONTROL register
