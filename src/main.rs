@@ -292,6 +292,16 @@ async fn user_task() {
 // Set the current task as unprivileged
 fn set_unpriviliged() {
     unsafe {
+        // ARM: Check if the task is in Handler or Thread mode
+        // via ipsr register
+        let ipsr: u32;
+        core::arch::asm!("mrs {}, ipsr", out(reg) ipsr);
+
+        if ipsr == 0 {
+            info!("Task is running in thread Mode");
+        } else {
+            info!("Task is running in handler Mode");
+        }
         // Unsafe code to modify the CONTROL register
         // Read the current value of the CONTROL register
         let mut control_reg = control::read();
@@ -299,8 +309,9 @@ fn set_unpriviliged() {
         control_reg.set_npriv(Npriv::Unprivileged);
         // Write the new value
         control::write(control_reg);
-        // Instruction Synchronization Barrier
+        // Instruction & Data Synchronization Barrier
         cortex_m::asm::isb();
+        cortex_m::asm::dsb();
 
         // Check if the task is unprivileged
         // Access to peripherls like usart should be forbidden
@@ -309,6 +320,23 @@ fn set_unpriviliged() {
             info!("User task is now unprivileged !");
         } else {
             info!("Error: User task is still privileged !");
+            // Further actions required to handle the error
+        }
+        // Unsafe code to modify the CONTROL register
+        // Try to set the task as privileged and see what happens
+        let mut control_reg = control::read();
+        // Set the nPRIV bit to unprivileged
+        control_reg.set_npriv(Npriv::Unprivileged);
+        // Write the new value
+        control::write(control_reg);
+        // Instruction & Data Synchronization Barrier
+        cortex_m::asm::isb();
+        cortex_m::asm::dsb();
+        // Check if the task now privileged
+        if let Npriv::Unprivileged = control::read().npriv() {
+            info!("User task is still unprivileged !");
+        } else {
+            info!("Error: User task is now privileged !");
             // Further actions required to handle the error
         }
     }
