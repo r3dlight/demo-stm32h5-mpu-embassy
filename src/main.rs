@@ -118,18 +118,11 @@ fn configure_mpu() {
         mpu.rlar.write(0x3FFFFFF0 | (1 << 4) | (2 << 1) | 1); // Attr index 1 (SRAM Memory)
         info!("Region 1 defined for SRAM1");
 
-        // To be more restrctive, we could also define a specific region for the shared buffer
-        // Embassy variables must be mapped first in a specific SRAM1 region
-        // The shared buffer will mapped in another SRAM region
-        // This has not been tested yet
-        //mpu.rnr.write(2);
-        //mpu.rbar
-        //    .write(((&SHARED_BUFFER as *const _ as u32) & 0xFFFFFFF0) | (1 << 1) | 1);
-        // Buffer size in RAM = 512 bytes -1 (inclusive)
-        // XN & PXN set to 1 to avoid execution from the buffer
-        //mpu.rlar
-        //    .write(((&SHARED_BUFFER as *const _ as u32 + 512 - 1) & 0xFFFFFFF0) | (1 << 4) | (2 << 1) | 1);
-        //info!("Region 2 defined for shared buffer");
+        // To be more restrictive, we could also define a specific region for the shared buffer
+        // Embassy variables will be mapped after in a specific SRAM1 region
+        // The shared buffer will mapped before SRAM region
+        // See git branch "separated_buffer" for more details
+        // Region 2 is left not configured for this demo
 
         // Select region 3 via MPU_RNR for Device Memory (Peripherals)
         // This code demo uses GPIO pins (button+LED) and write to USART with info!()
