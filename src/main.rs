@@ -32,6 +32,7 @@ enum ButtonStatus {
 // Signal to communicate between tasks
 static SIGNAL: Signal<CriticalSectionRawMutex, ButtonStatus> = Signal::new();
 // Mutable shared buffer between privileged and unprivileged tasks
+#[link_section = ".shared_buffer"]
 static mut SHARED_BUFFER: [u8; 512] = [0; 512];
 
 // Configure the MPU for the STM32H573
@@ -111,25 +112,31 @@ fn configure_mpu() {
 
         // Select region 1 via MPU_RNR for SRAM1
         mpu.rnr.write(1);
-        // SRAM1 begins at 0x20000000 and can be accessed by any privilege level
-        // Nevertheless, it is not executable (XN+PXN) for security reasons
-        mpu.rbar.write(0x20000000 | (1 << 1) | 1);
+        // SRAM1 begins at 0x20000200 now (the shared buffer is mapped before) 
+        // and can be accessed by any privilege level
+        // It is not executable (XN+PXN) for security reasons
+        // Next step could be to separate each task in a specific Flash region
+        mpu.rbar.write(0x20000200 | (1 << 1) | 1);
         // SRAM1 ends at 0x3FFFFFF0 (must be aligned to 32 bytes)
         mpu.rlar.write(0x3FFFFFF0 | (1 << 4) | (2 << 1) | 1); // Attr index 1 (SRAM Memory)
         info!("Region 1 defined for SRAM1");
 
-        // To be more restrctive, we could also define a specific region for the shared buffer
-        // Embassy variables must be mapped first in a specific SRAM1 region
-        // The shared buffer will mapped in another SRAM region
-        // This has not been tested yet
-        //mpu.rnr.write(2);
-        //mpu.rbar
-        //    .write(((&SHARED_BUFFER as *const _ as u32) & 0xFFFFFFF0) | (1 << 1) | 1);
+        // To be more restrictive, we could also define a specific region for the shared buffer
+        // defined at the beginning of the SRAM1.
+        // Embassy stack will be mapped after in a specific SRAM1 region
+        // This region starts at 0x20000200 and ends at 0x20000200 + 512 - 1 = 0x200003FF
+        mpu.rnr.write(2);
+        mpu.rbar
+            .write(((&raw const SHARED_BUFFER as *const _ as u32) & 0xFFFFFFF0) | (1 << 1) | 1);
         // Buffer size in RAM = 512 bytes -1 (inclusive)
         // XN & PXN set to 1 to avoid execution from the buffer
-        //mpu.rlar
-        //    .write(((&SHARED_BUFFER as *const _ as u32 + 512 - 1) & 0xFFFFFFF0) | (1 << 4) | (2 << 1) | 1);
-        //info!("Region 2 defined for shared buffer");
+        mpu.rlar.write(
+            ((&raw const SHARED_BUFFER as *const _ as u32 + 512 - 1) & 0xFFFFFFF0)
+                | (1 << 4)
+                | (2 << 1)
+                | 1,
+        );
+        info!("Region 2 defined for shared buffer");
 
         // Select region 3 via MPU_RNR for Device Memory (Peripherals)
         // This code demo uses GPIO pins (button+LED) and write to USART with info!()
