@@ -6,7 +6,6 @@ use core::str::from_utf8;
 use cortex_m::peripheral::MPU;
 //use cortex_m::peripheral::SCB;
 use cortex_m::register::control;
-//use cortex_m::register::control::Control;
 use cortex_m::register::control::Npriv;
 use defmt::*;
 use embassy_executor::Spawner;
@@ -22,6 +21,10 @@ use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Timer, WithTimeout};
 use {defmt_rtt as _, panic_probe as _};
 
+#[link_section = ".vector_table"]
+#[no_mangle]
+pub static VECTOR_TABLE: [u32; 48] = [0; 48];
+
 // User button status
 #[derive(Copy, Clone)]
 enum ButtonStatus {
@@ -35,8 +38,170 @@ static SIGNAL: Signal<CriticalSectionRawMutex, ButtonStatus> = Signal::new();
 #[link_section = ".shared_buffer"]
 static mut SHARED_BUFFER: [u8; 512] = [0; 512];
 
+// Enums for the MPU configuration
+#[repr(u32)]
+#[allow(non_camel_case_types)]
+enum MemoryAttributes {
+    flash = 0x44,
+    device = 0x04,
+    sram = 0x40,
+}
+
+#[repr(u32)]
+#[allow(non_camel_case_types)]
+enum MemoryType {
+    flash = 0,
+    sram1 = 1,
+    shared_buffer = 2,
+    device = 3,
+}
+#[repr(u32)]
+enum RegionNumber {
+    Region0 = 0,
+    Region1 = 1,
+    Region2 = 2,
+    Region3 = 3,
+    Region4 = 4,
+    Region5 = 5,
+    Region6 = 6,
+    Region7 = 7,
+    Region8 = 8,
+}
+
+#[repr(u32)]
+enum XN {
+    Executable = 0,
+    NonExecutable = 1,
+}
+#[repr(u32)]
+enum XPN {
+    ExecutionPermitted = 0,
+    ExecutionForbidden = 1,
+}
+
+#[repr(u32)]
+enum AccessPermissions {
+    RWPrivilegedOnly = 0b00,
+    RWAny = 0b01,
+    ROnlyPrivilegedOnly = 0b10,
+    ROnlyAny = 0b11,
+}
+
+#[repr(u32)]
+enum Sharability {
+    NonShareable = 0b00,
+    Reserved = 0b01,
+    OuterShareable = 0b10,
+    InnerShareable = 0b11,
+}
+// Should be filled automatically using the svd
+#[repr(u32)]
+enum MemoryAddr {
+    FlashBaseHandler = 0x00000000,
+    FlashLimitHandler = 0x0FFFFFFF,
+    FlashBaseTask1 = 0x10000000,
+    FlashLimitTask1 = 0x17FFFFFF,
+    FlashBaseTask2 = 0x18000000,
+    FlashLimitTask2 = 0x1FFFFFFF,
+    SharedBufferBase = 0x20000000,
+    SharedBufferLimit = 0x200003FF,
+    SRAMBase = 0x20000400,
+    SRAMLimit = 0x2009FFFF,
+    PeripheralsBase = 0x40000000,
+    PeripheralsLimit = 0x5FFFFFFF,
+}
+
+struct RegionConfig {
+    number: RegionNumber,
+    mtype: MemoryType,
+    base: MemoryAddr,
+    limit: MemoryAddr,
+    xn: XN,
+    xpn: XPN,
+    ap: AccessPermissions,
+    sharability: Sharability,
+}
+
+fn configure_region(config_region: RegionConfig) {
+    unsafe {
+        // Take a reference to the MPU
+        let mpu = &*MPU::PTR;
+
+        // Disable the MPU before configuration
+        mpu.ctrl.write(0);
+
+        // Data Synchronization Barrier
+        // Force write of registers
+        cortex_m::asm::dsb();
+
+        // Instruction Synchronization Barrier
+        // Flush the instruction pipeline and apply the new configuration
+        cortex_m::asm::isb();
+        // Configure MAIR (Memory Attribute Indirection Register)
+        // Indice 0 → Normal Memory, Indice 1 → Device Memory, Indice 2 → SRAM
+        // 0x44 = 0b01000100 : Flash Normal, Write-back
+        // 0x04 = 0b00000100 : Device Memory
+        // 0x40 = 0b01000000 : Normal, Write-back, non transient (SRAM)
+
+        // Defining 3 memory attributes for 3 different regions
+        // 4 attributes are possible (0-3) in MAIR0 register
+        // 4 atrributes are possible (4-7) in MAIR1 register
+        // 8 types of memory are possible (0-7) in the MPU_RLAR register
+        // Each attribute is 8 bits long
+        // We only use 3 attributes for this demo with MAIR0 register
+        mpu.mair[0].write(
+            ((MemoryAttributes::flash as u32) << 0)  // ATTRINDEX 0 → Flash (Normal, Write-back)
+            | ((MemoryAttributes::device as u32) << 8)  // ATTRINDEX 1 → Device Memory (SPI)
+            | ((MemoryAttributes::sram as u32) << 16), // ATTRINDEX 2 → RAM (Write-back, cachable)
+        );
+        // Select region number via MPU_RNR (Region NumbeR) for flash memory and remap zone
+        mpu.rnr.write(config_region.number as u32);
+        // MPU_RBAR definition
+        // MPU_RBAR is splitted into 4 parts:
+        // |31 (BASE ADDR) 5|4 (SHARABILITY) 3|2 (ACCESS PERMISSION) 1|0 (XN)|
+        // Base address for flash is remapped to 0x00000000 (see DDI0553B_y_armv8m_arm-1.pdf)
+        // SHARABILITY:       0b00: Non-shareable
+        //                    0b01: Reserved
+        //                    0b10: Outer Shareable
+        //                    0b11: Inner Shareable
+        // ACCESS PERMISSION: 0b00: Read/write by privileged code only,
+        //                    0b01: Read/write by any privilege level.
+        //                    0b10: Read-only by privileged code only
+        //                    0b11: Read-only by any privilege level
+        // XN (Execute-Never):
+        //                    0b0: Executable
+        //                    0b1: Non-executable
+        // In our case, Embassy needs the flash to be r/w & executable
+        // to be able to run the priviledged code.
+        mpu.rbar.write(
+            (config_region.base as u32)
+                | ((config_region.sharability as u32) << 3)
+                | ((config_region.ap as u32) << 1)
+                | ((config_region.xn as u32) << 1),
+        );
+        // MPU_RLAR definition
+        // MPU_RLAR is splitted into 4 parts:
+        // |31 (LIMIT ADDR) 5|4 PXN|3 (ATTR INDEX) 1|0 (EN)|
+        // Limit address for flash is 0x1FFFFFF0 (must be aligned to 32 bytes)
+        // PXN (Privileged eXecute Never):
+        //                    0b0: Execution only permitted if read permitted
+        //                    0b1: Execution from a privileged mode is not permitted
+        // ATTR INDEX:        Select the index previously defined in MAIR
+        // EN (Enable):       Enable the region:
+        //                    0b0: Region is disabled
+        //                    0b1: Region is enabled
+        mpu.rlar.write(
+            (config_region.limit as u32)
+                | ((config_region.xpn as u32) << 4)
+                | ((config_region.mtype as u32) << 1)
+                | 1,
+        );
+        // Now drop the reference to the MPU
+        let _ = drop(mpu);
+    }
+}
 // Configure the MPU for the STM32H573
-fn configure_mpu() {
+fn _configure_mpu() {
     unsafe {
         // Take a reference to the MPU
         let mpu = &*MPU::PTR;
@@ -65,10 +230,11 @@ fn configure_mpu() {
         // 4 atrributes are possible (4-7) in MAIR1 register
         // 8 types of memory are possible (0-7) in the MPU_RLAR register
         // Each attribute is 8 bits long
+        // We only use 3 attributes for this demo with MAIR0 register
         mpu.mair[0].write(
-            (0xFF << 0)  // ATTRINDEX 0 → Flash (Normal, Write-back)
-            | (0x04 << 8)  // ATTRINDEX 1 → Device Memory (SPI)
-            | (0x40 << 16), // ATTRINDEX 2 → RAM (Write-back, cachable)
+            ((MemoryAttributes::flash as u32) << 0)  // ATTRINDEX 0 → Flash (Normal, Write-back)
+            | ((MemoryAttributes::device as u32) << 8)  // ATTRINDEX 1 → Device Memory (SPI)
+            | ((MemoryAttributes::sram as u32) << 16), // ATTRINDEX 2 → RAM (Write-back, cachable)
         );
         /*  Bits	Value	        Signification
         01	    Normal Memory	Optimized for performance
@@ -112,7 +278,7 @@ fn configure_mpu() {
 
         // Select region 1 via MPU_RNR for SRAM1
         mpu.rnr.write(1);
-        // SRAM1 begins at 0x20000200 now (the shared buffer is mapped before) 
+        // SRAM1 begins at 0x20000200 now (the shared buffer is mapped before)
         // and can be accessed by any privilege level
         // It is not executable (XN+PXN) for security reasons
         // Next step could be to separate each task in a specific Flash region
@@ -168,12 +334,110 @@ fn configure_mpu() {
     info!("Congrats, MPU is re-enabled :)");
 }
 
+fn set_mpu() {
+    // Limited & privileged flash region for the Embassy code
+    let config_region = RegionConfig {
+        number: RegionNumber::Region0,
+        mtype: MemoryType::flash,
+        base: MemoryAddr::FlashBaseHandler,
+        limit: MemoryAddr::FlashLimitHandler,
+        xn: XN::Executable,
+        xpn: XPN::ExecutionPermitted,
+        ap: AccessPermissions::RWPrivilegedOnly,
+        sharability: Sharability::OuterShareable,
+    };
+    configure_region(config_region);
+    info!("Flash 1 configured");
+
+    // Flash region for the first task
+    let config_region = RegionConfig {
+        number: RegionNumber::Region1,
+        mtype: MemoryType::flash,
+        base: MemoryAddr::FlashBaseTask1,
+        limit: MemoryAddr::FlashLimitTask1,
+        xn: XN::Executable,
+        xpn: XPN::ExecutionPermitted,
+        ap: AccessPermissions::RWAny,
+        sharability: Sharability::OuterShareable,
+    };
+    configure_region(config_region);
+    info!("Flash 2 configured");
+
+    // Flash region for the second task
+    let config_region = RegionConfig {
+        number: RegionNumber::Region2,
+        mtype: MemoryType::flash,
+        base: MemoryAddr::FlashBaseTask2,
+        limit: MemoryAddr::FlashLimitTask2,
+        xn: XN::Executable,
+        xpn: XPN::ExecutionPermitted,
+        ap: AccessPermissions::RWAny,
+        sharability: Sharability::OuterShareable,
+    };
+    configure_region(config_region);
+    info!("Flash 3 configured");
+
+    // SRAM1 region for the Embassy stack
+    let config_region = RegionConfig {
+        number: RegionNumber::Region3,
+        mtype: MemoryType::sram1,
+        base: MemoryAddr::SRAMBase,
+        limit: MemoryAddr::SRAMLimit,
+        xn: XN::NonExecutable,
+        xpn: XPN::ExecutionForbidden,
+        ap: AccessPermissions::RWAny,
+        sharability: Sharability::InnerShareable,
+    };
+    configure_region(config_region);
+    info!("SRAM 1 configured");
+
+    // Shared buffer region for unprivileged and privileged tasks
+    // Can be shared with DMA, but not executable
+    let config_region = RegionConfig {
+        number: RegionNumber::Region4,
+        mtype: MemoryType::shared_buffer,
+        base: MemoryAddr::SharedBufferBase,
+        limit: MemoryAddr::SharedBufferLimit,
+        xn: XN::NonExecutable,
+        xpn: XPN::ExecutionForbidden,
+        ap: AccessPermissions::RWAny,
+        sharability: Sharability::OuterShareable,
+    };
+    configure_region(config_region);
+    info!("SRAM 2 configured");
+
+    // Device memory region for peripherals
+    let config_region = RegionConfig {
+        number: RegionNumber::Region5,
+        mtype: MemoryType::device,
+        base: MemoryAddr::PeripheralsBase,
+        limit: MemoryAddr::PeripheralsLimit,
+        xn: XN::NonExecutable,
+        xpn: XPN::ExecutionForbidden,
+        ap: AccessPermissions::RWAny,
+        sharability: Sharability::OuterShareable,
+    };
+    configure_region(config_region);
+    info!("Periph configured");
+
+    // Enable the MPU
+    unsafe {
+        let mpu = &*MPU::PTR;
+        mpu.ctrl.write(1);
+        // Data Synchronization Barrier
+        cortex_m::asm::dsb();
+        // Instruction Synchronization Barrier
+        cortex_m::asm::isb();
+    }
+    info!("MPU configured");
+}
 // Main privileged function
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     // Configure the MPU is blocking the execution
     // We want the MPU to be configured before anything else
-    configure_mpu();
+    set_mpu();
+    info!("All configured");
 
     // Doing some RCC configuration
     let mut config = Config::default();
@@ -281,6 +545,7 @@ async fn button_pressed(pc13: AnyPin, exti13: AnyChannel) {
     }
 }
 
+#[link_section = ".tache1_text"]
 #[embassy_executor::task]
 async fn user_task() {
     // Set the current task as unprivileged
