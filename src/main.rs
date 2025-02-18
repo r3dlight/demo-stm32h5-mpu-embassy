@@ -97,19 +97,22 @@ enum Sharability {
 // Should be filled automatically using the svd
 #[repr(u32)]
 enum MemoryAddr {
-    FlashBaseHandler = 0x00000000,
-    FlashLimitHandler = 0x0FFFFFFF,
-    FlashBaseTask1 = 0x10000000,
-    FlashLimitTask1 = 0x17FFFFFF,
-    FlashBaseTask2 = 0x18000000,
-    FlashLimitTask2 = 0x1FFFFFFF,
+    FlashBaseHandler = 0x08000000,
+    FlashLimitHandler = 0x0803FFFF,  // Limite ajustée à 256K
+    FlashBaseShared = 0x08040000,
+    FlashLimitShared = 0x0805FFFF,  // Limite ajustée à 128K pour code partagé
+    FlashBaseTask1 = 0x08060000,
+    FlashLimitTask1 = 0x0807FFFF,  // Limite ajustée à 128K
+    FlashBaseTask2 = 0x08080000,
+    FlashLimitTask2 = 0x0809FFFF,  // Limite ajustée à 128K
     SharedBufferBase = 0x20000000,
-    SharedBufferLimit = 0x200003FF,
-    SRAMBase = 0x20000400,
-    SRAMLimit = 0x2009FFFF,
+    SharedBufferLimit = 0x200001FF, // Taille de 512 octets
+    SRAMBase = 0x20000400,          // RAM après le buffer partagé
+    SRAMLimit = 0x2000D7FF,         // 54K - 512 octets
     PeripheralsBase = 0x40000000,
     PeripheralsLimit = 0x5FFFFFFF,
 }
+
 
 struct RegionConfig {
     number: RegionNumber,
@@ -197,7 +200,7 @@ fn configure_region(config_region: RegionConfig) {
                 | 1,
         );
         // Now drop the reference to the MPU
-        let _ = drop(mpu);
+        //let _ = drop(mpu);
     }
 }
 // Configure the MPU for the STM32H573
@@ -347,11 +350,25 @@ fn set_mpu() {
         sharability: Sharability::OuterShareable,
     };
     configure_region(config_region);
-    info!("Flash 1 configured");
+    info!("Privileged flash configured");
+
+    // Limited & privileged flash region for the shared code
+    let config_region = RegionConfig {
+        number: RegionNumber::Region1,
+        mtype: MemoryType::flash,
+        base: MemoryAddr::FlashBaseShared,
+        limit: MemoryAddr::FlashLimitShared,
+        xn: XN::Executable,
+        xpn: XPN::ExecutionPermitted,
+        ap: AccessPermissions::RWAny,
+        sharability: Sharability::OuterShareable,
+    };
+    configure_region(config_region);
+    info!("Shared flash configured");
 
     // Flash region for the first task
     let config_region = RegionConfig {
-        number: RegionNumber::Region1,
+        number: RegionNumber::Region2,
         mtype: MemoryType::flash,
         base: MemoryAddr::FlashBaseTask1,
         limit: MemoryAddr::FlashLimitTask1,
@@ -361,11 +378,11 @@ fn set_mpu() {
         sharability: Sharability::OuterShareable,
     };
     configure_region(config_region);
-    info!("Flash 2 configured");
+    info!("Flash task1 configured");
 
     // Flash region for the second task
     let config_region = RegionConfig {
-        number: RegionNumber::Region2,
+        number: RegionNumber::Region3,
         mtype: MemoryType::flash,
         base: MemoryAddr::FlashBaseTask2,
         limit: MemoryAddr::FlashLimitTask2,
@@ -375,11 +392,11 @@ fn set_mpu() {
         sharability: Sharability::OuterShareable,
     };
     configure_region(config_region);
-    info!("Flash 3 configured");
+    info!("Flash task2 configured");
 
     // SRAM1 region for the Embassy stack
     let config_region = RegionConfig {
-        number: RegionNumber::Region3,
+        number: RegionNumber::Region4,
         mtype: MemoryType::sram1,
         base: MemoryAddr::SRAMBase,
         limit: MemoryAddr::SRAMLimit,
@@ -394,7 +411,7 @@ fn set_mpu() {
     // Shared buffer region for unprivileged and privileged tasks
     // Can be shared with DMA, but not executable
     let config_region = RegionConfig {
-        number: RegionNumber::Region4,
+        number: RegionNumber::Region5,
         mtype: MemoryType::shared_buffer,
         base: MemoryAddr::SharedBufferBase,
         limit: MemoryAddr::SharedBufferLimit,
@@ -408,7 +425,7 @@ fn set_mpu() {
 
     // Device memory region for peripherals
     let config_region = RegionConfig {
-        number: RegionNumber::Region5,
+        number: RegionNumber::Region6,
         mtype: MemoryType::device,
         base: MemoryAddr::PeripheralsBase,
         limit: MemoryAddr::PeripheralsLimit,
@@ -436,6 +453,7 @@ fn set_mpu() {
 async fn main(spawner: Spawner) {
     // Configure the MPU is blocking the execution
     // We want the MPU to be configured before anything else
+    info!("Configuring the MPU...");
     set_mpu();
     info!("All configured");
 
@@ -545,7 +563,7 @@ async fn button_pressed(pc13: AnyPin, exti13: AnyChannel) {
     }
 }
 
-#[link_section = ".tache1_text"]
+#[link_section = ".tache1_section"]
 #[embassy_executor::task]
 async fn user_task() {
     // Set the current task as unprivileged
@@ -562,6 +580,8 @@ async fn user_task() {
 
 // Blocking & unsafe function, not a task
 // Set the current task as unprivileged
+// Must be shared between unprivileged tasks
+#[link_section = ".shared_code"]
 fn set_unpriviliged() {
     unsafe {
         // ARM: Check if the task is in Handler or Thread mode
