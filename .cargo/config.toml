@@ -1,6 +1,6 @@
 [target.thumbv8m.main-none-eabihf]
 runner = 'probe-rs run --chip STM32H573IIKx'
-rustflags = ["-C", "link-arg=-Tlinker/layout.ld"]
+#rustflags = ["-C", "link-arg=-Tlinker/layout.ld"]
 
 [build]
 target = "thumbv8m.main-none-eabihf"
